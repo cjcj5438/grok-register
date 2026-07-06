@@ -246,11 +246,11 @@ def cloudflare_create_temp_address(api_base):
     try:
         data = resp.json()
     except Exception:
-        raise Exception(f"Cloudflare /api/new_address 返回非JSON: {resp.text[:300]}")
+        raise Exception(f"Cloudflare {path} 返回非JSON: {resp.text[:300]}")
     address = data.get("address")
     jwt = data.get("jwt")
     if not address or not jwt:
-        raise Exception(f"Cloudflare /api/new_address 缺少 address/jwt: {data}")
+        raise Exception(f"Cloudflare {path} 缺少 address/jwt: {data}")
     return address, jwt
 
 
