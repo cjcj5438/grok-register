@@ -53,10 +53,21 @@ class OutputResult:
 
 
 @dataclass
+class RegistrationSettings:
+    count: int
+    enable_nsfw: bool = True
+    max_mail_retry: int = 3
+    max_slot_retry: int = 3
+    cleanup_interval: int = 5
+
+
+@dataclass
 class BatchResult:
     success_count: int = 0
     fail_count: int = 0
     processed_count: int = 0
+    registered_unsaved_count: int = 0
+    postprocess_warning_count: int = 0
     cancelled: bool = False
     results: list = field(default_factory=list)
 
@@ -152,24 +163,41 @@ def persist_account_result(result, callbacks, ops):
     )
 
 
+def _notify_observer(observer, result, account, output, callbacks):
+    try:
+        observer(result, account, output)
+    except Exception as exc:
+        callbacks.log(f"[Debug] observer 执行失败: {exc}")
+
+
 def run_batch(count, callbacks, observer, ops, enable_nsfw=True, cleanup_interval=5,
               max_slot_retry=3, max_mail_retry=3):
+    settings = RegistrationSettings(
+        count=int(count),
+        enable_nsfw=bool(enable_nsfw),
+        cleanup_interval=int(cleanup_interval),
+        max_slot_retry=int(max_slot_retry),
+        max_mail_retry=int(max_mail_retry),
+    )
     result = BatchResult()
     retry_count_for_slot = 0
-    ops.start_browser()
-    callbacks.log("[*] 浏览器已启动")
+    last_cleanup_success_count = 0
     try:
-        while result.processed_count < count:
+        ops.start_browser()
+        callbacks.log("[*] 浏览器已启动")
+        while result.processed_count < settings.count:
             if callbacks.cancelled():
                 result.cancelled = True
                 break
-            callbacks.log(f"--- 开始第 {result.processed_count + 1}/{count} 个账号 ---")
+            callbacks.log(f"--- 开始第 {result.processed_count + 1}/{settings.count} 个账号 ---")
             account = None
             output = None
             try:
                 account = register_one_account(
-                    callbacks, ops, enable_nsfw=enable_nsfw,
-                    max_mail_retry=max_mail_retry,
+                    callbacks,
+                    ops,
+                    enable_nsfw=settings.enable_nsfw,
+                    max_mail_retry=settings.max_mail_retry,
                 )
                 output = persist_account_result(account, callbacks, ops)
                 result.results.append({"registration": account, "output": output})
@@ -178,19 +206,35 @@ def run_batch(count, callbacks, observer, ops, enable_nsfw=True, cleanup_interva
                 if output.saved:
                     result.success_count += 1
                     callbacks.log(f"[+] 注册并保存成功: {account.email}")
+                    if (
+                        settings.cleanup_interval > 0
+                        and result.success_count % settings.cleanup_interval == 0
+                        and result.success_count != last_cleanup_success_count
+                        and result.processed_count < settings.count
+                    ):
+                        ops.cleanup(f"已成功 {result.success_count} 个账号，执行定期清理")
+                        last_cleanup_success_count = result.success_count
                 else:
                     result.fail_count += 1
+                    result.registered_unsaved_count += 1
                     callbacks.log(f"[-] 注册成功但持久化未完成: {account.email}")
-                if result.success_count > 0 and result.success_count % cleanup_interval == 0 and result.processed_count < count:
-                    ops.cleanup(f"已成功 {result.success_count} 个账号，执行定期清理")
+                pool_warning = any(
+                    state.get("enabled") and not state.get("ok")
+                    for state in output.pools.values()
+                )
+                cpa_warning = bool(output.cpa and not output.cpa.get("ok") and not output.cpa.get("skipped"))
+                if pool_warning or cpa_warning:
+                    result.postprocess_warning_count += 1
             except ops.cancelled_exception:
                 result.cancelled = True
                 callbacks.log("[!] 注册被停止")
                 break
             except ops.retry_exception as exc:
                 retry_count_for_slot += 1
-                if retry_count_for_slot <= max_slot_retry:
-                    callbacks.log(f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}")
+                if retry_count_for_slot <= settings.max_slot_retry:
+                    callbacks.log(
+                        f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{settings.max_slot_retry} 次: {exc}"
+                    )
                 else:
                     result.fail_count += 1
                     result.processed_count += 1
@@ -202,15 +246,17 @@ def run_batch(count, callbacks, observer, ops, enable_nsfw=True, cleanup_interva
                 retry_count_for_slot = 0
                 callbacks.log(f"[-] 注册失败: {exc}")
             finally:
-                observer(result, account, output)
+                _notify_observer(observer, result, account, output, callbacks)
                 if callbacks.cancelled():
                     result.cancelled = True
                     break
-                if ops.browser_missing():
-                    ops.start_browser()
-                else:
-                    ops.restart_browser()
-                ops.sleep(1)
+                if result.processed_count < settings.count:
+                    if ops.browser_missing():
+                        ops.start_browser()
+                    else:
+                        ops.restart_browser()
+                    ops.sleep(1)
     finally:
         ops.cleanup("任务结束")
     return result
+

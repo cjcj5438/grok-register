@@ -216,6 +216,26 @@ def validate_config(raw):
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ConfigError(f"配置项 {key} 必须是有效的 http/https URL")
 
+    provider = cfg["email_provider"]
+    if provider == "cloudflare" and not cfg["cloudflare_api_base"]:
+        raise ConfigError("Cloudflare 模式需要配置 cloudflare_api_base")
+    if provider == "cloudmail":
+        missing = [
+            key for key in ("cloudmail_api_base", "cloudmail_public_token", "cloudmail_domains")
+            if not cfg[key]
+        ]
+        if missing:
+            raise ConfigError("Cloud Mail 模式缺少必需配置: " + ", ".join(missing))
+    if cfg["grok2api_auto_add_remote"]:
+        missing = [
+            key for key in ("grok2api_remote_base", "grok2api_remote_app_key")
+            if not cfg[key]
+        ]
+        if missing:
+            raise ConfigError("远端 token 入池缺少必需配置: " + ", ".join(missing))
+    if cfg["cpa_copy_to_hotload"] and not cfg["cpa_hotload_dir"]:
+        raise ConfigError("启用 CPA 热加载复制时必须配置 cpa_hotload_dir")
+
     for key in path_keys:
         value = cfg[key]
         if value.startswith("~"):
@@ -3278,6 +3298,65 @@ def _queue_unsaved_account(path, payload, error, log_callback=None):
         return False
 
 
+def retry_pending_file(pending_path, output_path=None, log_callback=None):
+    logger = log_callback or (lambda message: None)
+    pending_path = os.path.abspath(os.path.expanduser(str(pending_path)))
+    if not os.path.isfile(pending_path):
+        raise FileNotFoundError(f"pending 文件不存在: {pending_path}")
+    suffix = ".pending.jsonl"
+    if output_path:
+        target_path = os.path.abspath(os.path.expanduser(str(output_path)))
+    elif pending_path.endswith(suffix):
+        target_path = pending_path[:-len(suffix)]
+    else:
+        target_path = pending_path + ".recovered.txt"
+    unresolved = []
+    restored = 0
+    with open(pending_path, "r", encoding="utf-8") as handle:
+        lines = handle.readlines()
+    for line_number, raw_line in enumerate(lines, 1):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped)
+            if not isinstance(record, dict):
+                raise ValueError("record must be a JSON object")
+            email = str(record.get("email") or "").strip()
+            password = str(record.get("password") or "")
+            sso = str(record.get("sso") or "").strip()
+            if not email or not sso:
+                raise ValueError("record missing email or sso")
+            _append_account_line(target_path, email, password, sso)
+            restored += 1
+            logger(f"[+] 已恢复 pending 账号: {email}")
+        except Exception as exc:
+            unresolved.append(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+            logger(f"[!] pending 第 {line_number} 行恢复失败: {exc}")
+    directory = os.path.dirname(pending_path) or "."
+    fd, temp_path = tempfile.mkstemp(prefix=".pending-retry-", suffix=".jsonl.tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.writelines(unresolved)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if unresolved:
+            os.replace(temp_path, pending_path)
+            temp_path = None
+            try:
+                os.chmod(pending_path, 0o600)
+            except Exception:
+                pass
+        else:
+            os.unlink(temp_path)
+            temp_path = None
+            os.unlink(pending_path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+    return {"restored": restored, "remaining": len(unresolved), "output_path": target_path}
+
+
 def run_registration_common(count, log_callback, cancel_callback, accounts_output_file, observer):
     from registration_flow import RegistrationCallbacks, RegistrationOperations, run_batch
     callbacks = RegistrationCallbacks(log=log_callback, cancelled=cancel_callback)
@@ -3775,6 +3854,22 @@ def main_cli():
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1].strip().lower() == "retry-pending":
+        if len(sys.argv) < 3:
+            print("用法: python grok_register_ttk.py retry-pending <pending文件> [输出文件]", file=sys.stderr)
+            return
+        try:
+            summary = retry_pending_file(
+                sys.argv[2],
+                output_path=sys.argv[3] if len(sys.argv) > 3 else None,
+                log_callback=cli_log,
+            )
+            cli_log(
+                f"[*] pending 恢复完成: 已恢复 {summary['restored']} | 剩余 {summary['remaining']} | 输出 {summary['output_path']}"
+            )
+        except Exception as exc:
+            log_exception("pending 恢复失败", exc, cli_log)
+        return
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
         main_cli()
         return

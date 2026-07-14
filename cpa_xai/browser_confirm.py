@@ -211,7 +211,7 @@ def create_standalone_page(proxy: Optional[str] = None, headless: bool = False, 
     except Exception:
         if browser is not None:
             close_standalone(browser)
-        elif proxy_bridge is not None:
+        if proxy_bridge is not None:
             try:
                 proxy_bridge.stop()
             except Exception:
