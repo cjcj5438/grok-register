@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Apply targeted audit fixes without rewriting the project structure."""
+"""Apply targeted audit fixes without rewriting the project structure.
+
+This script is intentionally idempotent because the repository may already
+contain some of the fixes from earlier interrupted bot runs.
+"""
 
 from pathlib import Path
 import ast
@@ -25,15 +29,34 @@ def write(path, content, encoding="utf-8"):
     path.write_text(content, encoding=encoding)
 
 
-def replace_once(text, old, new, label):
+def replace_required(text, old, new, label):
     count = text.count(old)
     if count != 1:
         raise RuntimeError(f"{label}: expected one match, got {count}")
     return text.replace(old, new, 1)
 
 
-def replace_optional(text, old, new):
+def replace_if_present(text, old, new):
     return text.replace(old, new, 1) if old in text else text
+
+
+def replace_func_between(text, start_marker, end_marker, new_block, label):
+    start = text.find(start_marker)
+    if start < 0:
+        if new_block in text:
+            return text
+        raise RuntimeError(f"{label}: start marker not found")
+    end = text.find(end_marker, start)
+    if end < 0:
+        raise RuntimeError(f"{label}: end marker not found")
+    return text[:start] + new_block + text[end:]
+
+
+def ensure_line(content, line):
+    lines = content.splitlines()
+    if line not in lines:
+        content = content.rstrip() + "\n" + line + "\n"
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -41,21 +64,21 @@ def replace_optional(text, old, new):
 # ---------------------------------------------------------------------------
 app = read(APP, encoding="utf-8-sig")
 
-# L-01: rewrite later as UTF-8 without BOM. Also make CLI independent from Tk.
-app = replace_once(
+# L-01 / M-05: UTF-8 without BOM and CLI can start without Tkinter installed.
+app = replace_if_present(
     app,
     "import tkinter as tk\nfrom tkinter import ttk, messagebox, scrolledtext\n",
     "try:\n    import tkinter as tk\n    from tkinter import ttk, messagebox, scrolledtext\n    TK_AVAILABLE = True\n    TK_IMPORT_ERROR = None\nexcept ImportError as exc:\n    tk = None\n    ttk = None\n    messagebox = None\n    scrolledtext = None\n    TK_AVAILABLE = False\n    TK_IMPORT_ERROR = exc\n",
-    "tkinter lazy import",
 )
-app = app.replace('def tk_button(parent, text="", command=None, state=tk.NORMAL, **kwargs):', 'def tk_button(parent, text="", command=None, state="normal", **kwargs):')
+app = app.replace(
+    'def tk_button(parent, text="", command=None, state=tk.NORMAL, **kwargs):',
+    'def tk_button(parent, text="", command=None, state="normal", **kwargs):',
+)
 
-# M-02: fail closed on broken config and align safe defaults with config.example.
+# M-02: safer defaults, matching config.example.json.
 app = app.replace('    "proxy": "http://127.0.0.1:7890",', '    "proxy": "",')
 app = app.replace('    "grok2api_auto_add_local": True,', '    "grok2api_auto_add_local": False,')
-app = replace_once(
-    app,
-    '''def load_config():
+old_load_config = '''def load_config():
     global config
     if os.path.exists(CONFIG_FILE):
         try:
@@ -65,8 +88,8 @@ app = replace_once(
         except Exception:
             config = DEFAULT_CONFIG.copy()
     return config
-''',
-    '''def load_config():
+'''
+new_load_config = '''def load_config():
     global config
     if os.path.exists(CONFIG_FILE):
         try:
@@ -82,54 +105,11 @@ app = replace_once(
     else:
         config = DEFAULT_CONFIG.copy()
     return config
-''',
-    "load_config fail closed",
-)
+'''
+app = replace_if_present(app, old_load_config, new_load_config)
 
-# H-05 / M-01: local token writes are now locked, backed up and atomic.
-app = replace_once(
-    app,
-    '''def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
-    token = _normalize_sso_token(raw_token)
-    if not token:
-        return False
-    token_file = resolve_grok2api_local_token_file()
-    pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip()
-    if not pool_name:
-        pool_name = "ssoBasic"
-    os.makedirs(os.path.dirname(token_file), exist_ok=True)
-    data = {}
-    if os.path.exists(token_file):
-        try:
-            with open(token_file, "r", encoding="utf-8") as f:
-                data = json.load(f) or {}
-        except Exception:
-            data = {}
-    if not isinstance(data, dict):
-        data = {}
-    pool = data.get(pool_name)
-    if not isinstance(pool, list):
-        pool = []
-    existing = set()
-    for item in pool:
-        if isinstance(item, str):
-            existing.add(_normalize_sso_token(item))
-        elif isinstance(item, dict):
-            existing.add(_normalize_sso_token(item.get("token", "")))
-    if token in existing:
-        if log_callback:
-            log_callback(f"[*] grok2api 本地池已存在 token: {pool_name}")
-        return True
-    entry = {"token": token, "tags": ["auto-register"], "note": email}
-    pool.append(entry)
-    data[pool_name] = pool
-    with open(token_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    if log_callback:
-        log_callback(f"[+] 已写入 grok2api 本地池: {pool_name} ({token_file})")
-    return True
-''',
-    '''def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
+# H-05 / M-01: local token writes are locked, backed up and atomic.
+new_local_pool = '''def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
     token = _normalize_sso_token(raw_token)
     if not token:
         return False
@@ -182,23 +162,36 @@ app = replace_once(
             except Exception as exc:
                 raise RuntimeError(f"创建本地 token 备份失败，拒绝继续写入: {exc}")
         temp_path = token_file + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_path, token_file)
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, token_file)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
     if log_callback:
         log_callback(f"[+] 已写入 grok2api 本地池: {pool_name} ({token_file})")
     return True
-''',
-    "atomic local token pool",
-)
+
+
+'''
+if "with FileLock(lock_path" not in app:
+    app = replace_func_between(
+        app,
+        "def add_token_to_grok2api_local_pool(raw_token, email=\"\", log_callback=None):\n",
+        "def get_grok2api_remote_api_bases(base):\n",
+        new_local_pool,
+        "atomic local token pool",
+    )
 
 # H-01: remote fallback must not POST a full replacement unless old state was read.
-app = replace_once(
-    app,
-    '''    # 兜底：旧版全量保存接口
+old_remote_fallback = '''    # 兜底：旧版全量保存接口
     current = {}
     fallback_base = api_bases[0] if api_bases else base
     for api_base in api_bases or [base]:
@@ -213,8 +206,8 @@ app = replace_once(
             continue
     if not isinstance(current, dict):
         current = {}
-''',
-    '''    # 兜底：旧版全量保存接口。必须先成功读取远端旧状态，避免空池覆盖。
+'''
+new_remote_fallback = '''    # 兜底：旧版全量保存接口。必须先成功读取远端旧状态，避免空池覆盖。
     current = {}
     fallback_base = api_bases[0] if api_bases else base
     loaded_remote_state = False
@@ -238,20 +231,20 @@ app = replace_once(
             load_errors.append(f"{api_base}/tokens: {exc}")
     if not loaded_remote_state:
         raise RuntimeError("无法安全读取远端 token 池，拒绝执行全量覆盖: " + "; ".join(load_errors))
-''',
-    "remote fail closed fallback",
-)
+'''
+app = replace_if_present(app, old_remote_fallback, new_remote_fallback)
 
 # M-06: do not hide unexpected SSO wait exceptions forever.
-app = replace_once(
-    app,
-    '''    final_no_submit_state = ""
+if "last_wait_exception_message" not in app:
+    app = replace_if_present(
+        app,
+        '''    final_no_submit_state = ""
     final_no_submit_since = None
     final_no_submit_timeout = 25
 
     while time.time() < deadline:
 ''',
-    '''    final_no_submit_state = ""
+        '''    final_no_submit_state = ""
     final_no_submit_since = None
     final_no_submit_timeout = 25
     last_wait_exception_message = ""
@@ -259,16 +252,15 @@ app = replace_once(
 
     while time.time() < deadline:
 ''',
-    "wait_for_sso diagnostics vars",
-)
-app = replace_once(
-    app,
-    '''        except Exception:
+    )
+    app = replace_if_present(
+        app,
+        '''        except Exception:
             pass
 
         sleep_with_cancel(1, cancel_callback)
 ''',
-    '''        except Exception as exc:
+        '''        except Exception as exc:
             if log_callback:
                 now = time.time()
                 message = f"{exc.__class__.__name__}: {exc}"
@@ -279,8 +271,7 @@ app = replace_once(
 
         sleep_with_cancel(1, cancel_callback)
 ''',
-    "wait_for_sso limited exception log",
-)
+    )
 
 # L-02: repair known mojibake that affects logs/control flow.
 for bad, good in {
@@ -290,102 +281,8 @@ for bad, good in {
 }.items():
     app = app.replace(bad, good)
 
-# L-06: centralize the duplicated successful-account output side effects.
-if "def handle_successful_account_outputs(" not in app:
-    app = replace_once(
-        app,
-        '''    return result
-
-
-class GrokRegisterGUI:
-''',
-        '''    return result
-
-
-def handle_successful_account_outputs(email, password, sso, accounts_output_file, log_callback=None, cancel_callback=None):
-    logger = log_callback or (lambda message: None)
-    try:
-        line = f"{email}----{password or ''}----{sso}\n"
-        with open(accounts_output_file, "a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception as file_exc:
-        logger(f"[Debug] 保存账号文件失败: {file_exc}")
-    add_token_to_grok2api_pools(sso, email=email, log_callback=logger)
-    maybe_export_cpa_xai_after_success(
-        email=email,
-        password=password or "",
-        sso=sso,
-        log_callback=logger,
-        cancel_callback=cancel_callback,
-    )
-
-
-class GrokRegisterGUI:
-''',
-        "success output helper",
-    )
-
-app = replace_once(
-    app,
-    '''                    try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                            f.write(line)
-                    except Exception as file_exc:
-                        self.log(f"[Debug] 保存账号文件失败: {file_exc}")
-                    add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
-                    maybe_export_cpa_xai_after_success(
-                        email=email,
-                        password=profile.get("password", ""),
-                        sso=sso,
-                        log_callback=self.log,
-                        cancel_callback=self.should_stop,
-                    )
-''',
-    '''                    handle_successful_account_outputs(
-                        email=email,
-                        password=profile.get("password", ""),
-                        sso=sso,
-                        accounts_output_file=self.accounts_output_file,
-                        log_callback=self.log,
-                        cancel_callback=self.should_stop,
-                    )
-''',
-    "GUI success output helper call",
-)
-app = replace_once(
-    app,
-    '''                try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
-                    with open(accounts_output_file, "a", encoding="utf-8") as f:
-                        f.write(line)
-                except Exception as file_exc:
-                    cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
-                add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
-                maybe_export_cpa_xai_after_success(
-                    email=email,
-                    password=profile.get("password", ""),
-                    sso=sso,
-                    log_callback=cli_log,
-                    cancel_callback=controller.should_stop,
-                )
-''',
-    '''                handle_successful_account_outputs(
-                    email=email,
-                    password=profile.get("password", ""),
-                    sso=sso,
-                    accounts_output_file=accounts_output_file,
-                    log_callback=cli_log,
-                    cancel_callback=controller.should_stop,
-                )
-''',
-    "CLI success output helper call",
-)
-
 # M-05: GUI-only Tk failure should not break CLI mode.
-app = replace_once(
-    app,
-    '''def main():
+old_main = '''def main():
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
         main_cli()
         return
@@ -393,8 +290,8 @@ app = replace_once(
     setup_light_theme(root)
     app = GrokRegisterGUI(root)
     root.mainloop()
-''',
-    '''def main():
+'''
+new_main = '''def main():
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
         main_cli()
         return
@@ -406,9 +303,8 @@ app = replace_once(
     setup_light_theme(root)
     app = GrokRegisterGUI(root)
     root.mainloop()
-''',
-    "main Tk guard",
-)
+'''
+app = replace_if_present(app, old_main, new_main)
 
 ast.parse(app)
 write(APP, app, encoding="utf-8")
@@ -418,9 +314,7 @@ write(APP, app, encoding="utf-8")
 # ---------------------------------------------------------------------------
 browser = read(BROWSER)
 browser = browser.replace("except BaseException as exc:", "except Exception as exc:")
-browser = replace_once(
-    browser,
-    '''    from .proxyutil import proxy_for_chromium, proxy_log_label, resolve_proxy
+old_proxy_block = '''    from .proxyutil import proxy_for_chromium, proxy_log_label, resolve_proxy
 
     resolved = resolve_proxy(proxy)
     chrome_proxy = proxy_for_chromium(resolved)
@@ -434,8 +328,8 @@ browser = replace_once(
     page = browser.latest_tab
     logger("standalone chromium started")
     return browser, page
-''',
-    '''    from .proxyutil import prepare_chromium_proxy, proxy_log_label, resolve_proxy
+'''
+new_proxy_block = '''    from .proxyutil import prepare_chromium_proxy, proxy_log_label, resolve_proxy
 
     resolved = resolve_proxy(proxy)
     proxy_bridge = None
@@ -456,12 +350,9 @@ browser = replace_once(
     page = browser.latest_tab
     logger("standalone chromium started")
     return browser, page
-''',
-    "CPA authenticated browser proxy bridge",
-)
-browser = replace_once(
-    browser,
-    '''def close_standalone(browser: Any) -> None:
+'''
+browser = replace_if_present(browser, old_proxy_block, new_proxy_block)
+old_close_block = '''def close_standalone(browser: Any) -> None:
     try:
         browser.quit()
     except Exception:
@@ -469,8 +360,8 @@ browser = replace_once(
 
 
 _mint_tls = threading.local()
-''',
-    '''def close_standalone(browser: Any) -> None:
+'''
+new_close_block = '''def close_standalone(browser: Any) -> None:
     if browser is None:
         return
     _unregister_mint_browser(browser)
@@ -503,12 +394,10 @@ def _unregister_mint_browser(browser: Any) -> None:
         return
     with _mint_registry_lock:
         _mint_registry.discard(browser)
-''',
-    "CPA global browser registry",
-)
-browser = replace_once(
-    browser,
-    '''def shutdown_mint_browsers() -> None:
+'''
+if "_mint_registry = set()" not in browser:
+    browser = replace_required(browser, old_close_block, new_close_block, "CPA global browser registry")
+old_shutdown = '''def shutdown_mint_browsers() -> None:
     state = _mint_tls_get()
     browser = state.get("browser")
     if browser is not None:
@@ -517,8 +406,8 @@ browser = replace_once(
         except Exception:
             pass
     state.update({"browser": None, "page": None, "served": 0, "proxy": None, "headless": None})
-''',
-    '''def shutdown_mint_browsers() -> None:
+'''
+new_shutdown = '''def shutdown_mint_browsers() -> None:
     state = _mint_tls_get()
     with _mint_registry_lock:
         browsers = list(_mint_registry)
@@ -528,12 +417,9 @@ browser = replace_once(
         except Exception:
             pass
     state.update({"browser": None, "page": None, "served": 0, "proxy": None, "headless": None})
-''',
-    "CPA shutdown all registered browsers",
-)
-browser = replace_once(
-    browser,
-    '''        def _poll() -> None:
+'''
+browser = replace_if_present(browser, old_shutdown, new_shutdown)
+old_poll = '''        def _poll() -> None:
             try:
                 time.sleep(2)
                 result = poll_device_token(
@@ -551,8 +437,8 @@ browser = replace_once(
             except Exception as exc:
                 error_box["err"] = exc
                 stop_event.set()
-''',
-    '''        def combined_cancel():
+'''
+new_poll = '''        def combined_cancel():
             return stop_event.is_set() or bool(cancel and cancel())
 
         def _poll() -> None:
@@ -576,17 +462,14 @@ browser = replace_once(
             except Exception as exc:
                 error_box["err"] = exc
                 stop_event.set()
-''',
-    "CPA combined cancel",
-)
-browser = replace_once(
-    browser,
-    '''            if hard:
+'''
+browser = replace_if_present(browser, old_poll, new_poll)
+old_join = '''            if hard:
                 stop_event.set()
                 raise
         thread.join(timeout=max(browser_timeout_sec, 60) + 30)
-''',
-    '''            if hard:
+'''
+new_join = '''            if hard:
                 stop_event.set()
                 thread.join(timeout=5)
                 if thread.is_alive():
@@ -598,17 +481,14 @@ browser = replace_once(
             thread.join(timeout=5)
             if thread.is_alive():
                 raise OAuthDeviceError("token poll thread did not stop after timeout")
-''',
-    "CPA poll thread join on browser failure",
-)
+'''
+browser = replace_if_present(browser, old_join, new_join)
 ast.parse(browser)
 write(BROWSER, browser)
 
 oauth = read(OAUTH)
 oauth = oauth.replace("except BaseException as exc:", "except Exception as exc:")
-oauth = replace_once(
-    oauth,
-    '''def poll_device_token(
+old_poll_header = '''def poll_device_token(
     device_code,
     token_endpoint,
     client_id=CLIENT_ID,
@@ -627,8 +507,8 @@ oauth = replace_once(
     while time.time() < deadline:
         if cancel and cancel():
             raise OAuthDeviceError("cancelled")
-''',
-    '''def _sleep_with_cancel(seconds, cancel=None):
+'''
+new_poll_header = '''def _sleep_with_cancel(seconds, cancel=None):
     deadline = time.time() + max(float(seconds), 0.0)
     while time.time() < deadline:
         if cancel and cancel():
@@ -655,14 +535,11 @@ def poll_device_token(
     while time.time() < deadline:
         if cancel and cancel():
             raise OAuthDeviceError("cancelled")
-''',
-    "oauth cancellable sleep helper",
-)
-for old in (
-    "time.sleep(wait_seconds)",
-    "time.sleep(sleep_seconds)",
-):
-    oauth = oauth.replace(old, old.replace("time.sleep", "_sleep_with_cancel").replace(")", ", cancel)"))
+'''
+if "def _sleep_with_cancel(" not in oauth:
+    oauth = replace_required(oauth, old_poll_header, new_poll_header, "oauth cancellable sleep helper")
+    oauth = oauth.replace("time.sleep(wait_seconds)", "_sleep_with_cancel(wait_seconds, cancel)")
+    oauth = oauth.replace("time.sleep(sleep_seconds)", "_sleep_with_cancel(sleep_seconds, cancel)")
 ast.parse(oauth)
 write(OAUTH, oauth)
 
@@ -670,35 +547,30 @@ write(OAUTH, oauth)
 # CPA schema/writer hardening.
 # ---------------------------------------------------------------------------
 schema = read(SCHEMA)
-schema = replace_once(
-    schema,
-    '''    expired = ""
+old_expired = '''    expired = ""
     if exp:
         expired = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-''',
-    '''    expired = ""
+'''
+new_expired = '''    expired = ""
     if exp:
         expired = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     elif expires_in:
         expired = datetime.fromtimestamp(time.time() + int(expires_in or 0), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-''',
-    "CPA expired fallback",
-)
+'''
+schema = replace_if_present(schema, old_expired, new_expired)
 ast.parse(schema)
 write(SCHEMA, schema)
 
 writer = read(WRITER)
-writer = replace_once(
-    writer,
-    '''def write_cpa_xai_auth(auth_dir, payload, filename=None):
+old_writer_head = '''def write_cpa_xai_auth(auth_dir, payload, filename=None):
     root = Path(auth_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     target_name = filename or credential_file_name(payload.get("email", ""), payload.get("sub", ""))
     if not str(target_name).endswith(".json"):
         target_name = str(target_name) + ".json"
     destination = root / str(target_name)
-''',
-    '''def _is_relative_to(path, root):
+'''
+new_writer_head = '''def _is_relative_to(path, root):
     try:
         path.relative_to(root)
         return True
@@ -716,9 +588,8 @@ def write_cpa_xai_auth(auth_dir, payload, filename=None):
     destination = (root / str(target_name)).resolve()
     if not _is_relative_to(destination, root):
         raise ValueError("CPA auth filename must stay inside auth_dir")
-''',
-    "CPA writer path guard",
-)
+'''
+writer = replace_if_present(writer, old_writer_head, new_writer_head)
 ast.parse(writer)
 write(WRITER, writer)
 
@@ -730,9 +601,8 @@ req = req.replace("DrissionPage==4.1.1.2", "DrissionPage>=4.1.1.2,<4.2")
 write(REQ, req)
 
 gitignore = read(GITIGNORE)
-for line in ("screenshots/", "*.png"):
-    if line not in gitignore.splitlines():
-        gitignore = gitignore.rstrip() + "\n" + line + "\n"
+gitignore = ensure_line(gitignore, "screenshots/")
+gitignore = ensure_line(gitignore, "*.png")
 write(GITIGNORE, gitignore)
 
 readme = read(README)
@@ -740,9 +610,7 @@ readme = readme.replace(
     "- `cpa_auths/cpa_auth_failed.txt`：OIDC 导出失败记录。\n- `*.log`：可选日志文件。",
     "- `cpa_auths/cpa_auth_failed.txt`：OIDC 导出失败记录。\n- `screenshots/`：CPA/OIDC 浏览器失败调试截图，已被 `.gitignore` 忽略。\n- `*.log`：可选日志文件。",
 )
-readme = replace_once(
-    readme,
-    '''```text
+old_tree = '''```text
 .
 ├── grok_register_ttk.py   # 主程序
 ├── cf_mail_debug.py       # Cloudflare 邮箱调试工具
@@ -750,8 +618,8 @@ readme = replace_once(
 ├── requirements.txt       # Python 依赖
 └── README.md
 ```
-''',
-    '''```text
+'''
+new_tree = '''```text
 .
 ├── grok_register_ttk.py   # 主程序（GUI / CLI）
 ├── cpa_export.py          # 注册成功后的 CPA/OIDC 导出入口
@@ -763,9 +631,8 @@ readme = replace_once(
 ├── assets/                # README 资源
 └── README.md
 ```
-''',
-    "README directory tree",
-)
+'''
+readme = replace_if_present(readme, old_tree, new_tree)
 write(README, readme)
 
 # Final syntax validation for touched Python files.
