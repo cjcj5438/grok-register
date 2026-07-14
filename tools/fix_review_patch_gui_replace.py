@@ -19,13 +19,13 @@ if end < 0:
     raise RuntimeError("GUI UI replacement block end not found")
 
 replacement = r'''app = between(app, "    def log(self, message):\n", "    def should_stop(self):\n", ''' + "'''" + r'''    def _call_ui(self, func, *args):
-    if threading.get_ident() == self._ui_thread_id:
-        func(*args)
-        return
-    try:
-        self.root.after(0, lambda: func(*args))
-    except Exception:
-        pass
+        if threading.get_ident() == self._ui_thread_id:
+            func(*args)
+            return
+        try:
+            self.root.after(0, lambda: func(*args))
+        except Exception:
+            pass
 
     def _append_log_line(self, line):
         self.log_text.insert(tk.END, f"{line}\n")
