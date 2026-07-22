@@ -38,6 +38,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - [安装](#安装)
 - [配置](#配置)
 - [运行方式](#运行方式)
+- [启动指南（分终端）](docs/启动指南.md)
 - [输出与 pending 恢复](#输出与-pending-恢复)
 - [稳定性与安全机制](#稳定性与安全机制)
 - [项目架构](#项目架构)
@@ -308,10 +309,25 @@ CPA 浏览器直接复用 `browser_runtime.py` 的 Chromium options 和 `cpa_xai
 
 ## 运行方式
 
+> 分终端（PowerShell / CMD / Git Bash / Linux）的完整启动步骤与常见报错，见 **[docs/启动指南.md](docs/启动指南.md)**。
+
 ### GUI
 
 ```bash
 python grok_register_ttk.py
+```
+
+Windows PowerShell 示例（先激活虚拟环境）：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python grok_register_ttk.py
+```
+
+或不激活，直接使用虚拟环境解释器：
+
+```powershell
+.\.venv\Scripts\python.exe grok_register_ttk.py
 ```
 
 GUI 启动时读取配置并执行结构校验。填写配置后点击“开始注册”，程序会执行完整运行校验，只保存一次配置，然后启动后台线程。
